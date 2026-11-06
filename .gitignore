@@ -1,0 +1,26 @@
+# 运行时数据：真实账本、事件日志、导出的账本文件，绝不入库
+web/data/*
+!web/data/.gitkeep
+*.jsonl
+*.log
+
+# 私密材料
+.env
+.env.*
+*.key
+*.pem
+*_backup.json
+简记_加密账本_*.json
+简记_不可变账本_*.json
+简记_锚定证明_*.json
+
+# Node / 系统
+node_modules/
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# WorkBuddy 工作区私有数据
+.workbuddy-ai/
