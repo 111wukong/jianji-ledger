@@ -1,8 +1,11 @@
-/* 本机加密账本库。只写入密文记录与签名，不保存解密后的账目。 */
+/* 本机加密账本库。只写入密文记录与签名，不保存解密后的账目。
+   entries   = 正常读写用的账本记录（含待同步队列）
+   archive   = 后台静默保存的全量加密归档（双层加密，仅灾备与迁移用）
+   meta      = 账本目录、同步时间、归档参数等非敏感元数据 */
 (function (root) {
   'use strict';
   const DB_NAME = 'jianji.unified.v1';
-  const DB_VERSION = 1;
+  const DB_VERSION = 2;
   let dbPromise = null;
 
   function open() {
@@ -14,6 +17,10 @@
         const db = req.result;
         if (!db.objectStoreNames.contains('entries')) {
           const store = db.createObjectStore('entries', { keyPath: 'key' });
+          store.createIndex('fp', 'fp', { unique: false });
+        }
+        if (!db.objectStoreNames.contains('archive')) {
+          const store = db.createObjectStore('archive', { keyPath: 'key' });
           store.createIndex('fp', 'fp', { unique: false });
         }
         if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
@@ -68,6 +75,11 @@
       for (const entry of entries) store.put(normalize(fp, entry, pending));
     });
   }
+  /* 增量写入服务端新增的后缀，避免每次轮询删光并重写整本账。 */
+  async function putSynced(fp, entries) {
+    if (!entries || !entries.length) return;
+    await putMany(fp, entries, false);
+  }
   async function markSynced(fp, entry) { return put(fp, entry, false); }
   async function remove(fp, hash) { await tx('entries', 'readwrite', store => store.delete(key(fp, hash))); }
 
@@ -91,5 +103,28 @@
     await tx('entries', 'readwrite', store => { for (const row of rows) store.delete(row.key); });
   }
 
-  root.LedgerStore = { all, put, putMany, markSynced, remove, replaceSynced, setMeta, getMeta, clear };
+  async function archiveAll(fp) {
+    const rows = await request('archive', 'readonly', store => store.index('fp').getAll(fp));
+    return rows.sort((a, b) => a.seq - b.seq);
+  }
+  async function archiveReplace(fp, rows) {
+    const old = await archiveAll(fp);
+    await tx('archive', 'readwrite', store => {
+      for (const row of old) store.delete(row.key);
+      for (const row of rows) store.put(row);
+    });
+  }
+  async function archiveStats(fp) {
+    const rows = await archiveAll(fp);
+    let bytes = 0;
+    for (const r of rows) bytes += (r.blob ? r.blob.length : 0) + (r.iv ? r.iv.length : 0);
+    return { count: rows.length, bytes };
+  }
+  async function archiveClear(fp) {
+    const rows = await archiveAll(fp);
+    await tx('archive', 'readwrite', store => { for (const row of rows) store.delete(row.key); });
+  }
+
+  root.LedgerStore = { all, put, putMany, putSynced, markSynced, remove, replaceSynced,
+    setMeta, getMeta, clear, archiveAll, archiveReplace, archiveStats, archiveClear };
 })(typeof globalThis !== 'undefined' ? globalThis : window);

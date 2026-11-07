@@ -2,7 +2,9 @@
 web/data/*
 !web/data/.gitkeep
 *.jsonl
+*.jsonl.enc
 *.log
+backups/
 
 # 私密材料
 .env
@@ -13,6 +15,10 @@ web/data/*
 简记_加密账本_*.json
 简记_不可变账本_*.json
 简记_锚定证明_*.json
+简记_身份凭据_*.json
+简记_加密归档_*.json
+简记_分叉证据_*.json
+简记_重建前备份_*.json
 
 # Node / 系统
 node_modules/

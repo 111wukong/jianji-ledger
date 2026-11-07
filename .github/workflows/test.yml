@@ -15,7 +15,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm test
+      - name: 核心纯函数测试 + 服务端 HTTP 集成测试
+        run: npm test
+      - name: 灾难恢复演练（删库后从加密备份还原）
+        run: npm run drill:restore
       - run: npm run build
       - name: 确认单文件构建产物已同步
         run: git diff --exit-code local/index.html

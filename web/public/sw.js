@@ -1,7 +1,8 @@
 'use strict';
-const CACHE = 'jianji-shell-v4';
+const CACHE = 'jianji-shell-v6';
 const SHELL = [
-  '/', '/index.html', '/style.css', '/app.js', '/offline-store.js', '/sync-core.cjs',
+  '/', '/index.html', '/style.css', '/app.js', '/offline-store.js', '/sync-core.cjs', '/archive-core.cjs',
+  '/unlock-core.cjs', '/theme-init.js',
   '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png',
   '/verify.html', '/verify.js', '/anchor-core.cjs'
 ];

@@ -10,13 +10,15 @@
 <link rel="apple-touch-icon" href="/icons/icon-192.png">
 <link rel="manifest" href="/manifest.webmanifest">
 <title>简记 · 离线优先的统一账本</title>
-<script>try{document.documentElement.dataset.theme=localStorage.getItem('jianji.theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}catch(e){}</script>
+<script src="/theme-init.js"></script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <div id="app"></div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <script src="/sync-core.cjs"></script>
+<script src="/archive-core.cjs"></script>
+<script src="/unlock-core.cjs"></script>
 <script src="/offline-store.js"></script>
 <script src="/app.js"></script>
 </body>
