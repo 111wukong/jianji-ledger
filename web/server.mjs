@@ -8,6 +8,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUB = path.join(ROOT, 'public');
 const DATA = path.join(ROOT, 'data');
 const LOG = path.join(DATA, 'events.jsonl');
+let logFd = null;
 const PORT = Number(process.env.PORT) || 3000;
 const SECRET = crypto.randomBytes(32);
 const GENESIS = '0'.repeat(64);
@@ -67,7 +68,11 @@ function apply(ev) {
     case 'anchor': anchors.push(ev); anchorHead = ev.hash; anchorClock = Math.max(anchorClock, ev.ts || 0); break;
   }
 }
-function writeLine(o) { fs.appendFileSync(LOG, JSON.stringify(o) + '\n', 'utf8'); }
+function writeLine(o) {
+  const buf = Buffer.from(JSON.stringify(o) + '\n', 'utf8');
+  let offset = 0;
+  while (offset < buf.length) offset += fs.writeSync(logFd, buf, offset, buf.length - offset);
+}
 /* 每个事件后立刻追加一条锚点：Merkle 根被串进只追加的锚链。
    事后替换整个存储会破坏锚链前缀，任何人用旧锚点即可发现。 */
 function append(ev) {
@@ -85,9 +90,26 @@ if (fs.existsSync(LOG)) {
     try { apply(JSON.parse(line)); } catch (e) { console.warn('跳过损坏事件行'); }
   }
 }
+/* 持久追加描述符：避免每条事件都重新按路径打开文件，仍保持同步写入顺序。 */
+logFd = fs.openSync(LOG, 'a');
 const merkleRoot = () => sha(Array.from(owners.values()).map(o => o.fp + ':' + o.head).sort().join('|'));
 const anchorOf = o => ({ fp: o.fp, seq: o.seq, head: o.head, count: o.chain.length, updated: o.updated || o.created });
 const publicChain = o => o.chain.map(e => ({ seq: e.seq, prevHash: e.prevHash, hash: e.hash, ts: e.ts, sig: e.sig }));
+
+function appendEntry(me, data) {
+  const existing = me.chain.find(e => e.hash === data.hash);
+  if (existing) return { status: 'existing', seq: existing.seq, hash: existing.hash };
+  if (data.seq !== me.seq + 1) return { status: 'error', code: 409, error: '序号不连续，账本可能已在别处更新' };
+  if (data.prevHash !== me.head) return { status: 'error', code: 409, error: '前序哈希不匹配，检测到账本分叉' };
+  if (typeof data.cipher !== 'string' || !data.cipher || data.cipher.length > 200000)
+    return { status: 'error', code: 400, error: '密文格式无效' };
+  const calc = sha([data.seq, data.prevHash, me.fp, data.cipher, data.bookTag, data.ts].join('|'));
+  if (calc !== data.hash) return { status: 'error', code: 400, error: '记录哈希不匹配' };
+  if (!verifySig(me.pubSign, data.hash, data.sig)) return { status: 'error', code: 401, error: '记录签名无效' };
+  append({ t: 'entry', fp: me.fp, seq: data.seq, prevHash: data.prevHash, hash: data.hash,
+    cipher: data.cipher, sig: data.sig, bookTag: clean(data.bookTag), ts: Number(data.ts) || Date.now() });
+  return { status: 'accepted', seq: me.seq, hash: data.hash };
+}
 
 function send(res, code, obj, type) {
   const body = type === 'text' ? obj : JSON.stringify(obj);
@@ -104,7 +126,9 @@ function body(req) {
   });
 }
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml' };
+  '.cjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml',
+  '.webmanifest': 'application/manifest+json; charset=utf-8', '.png': 'image/png' };
 function serveStatic(req, res, pathname) {
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   const file = path.resolve(PUB, rel);
@@ -126,7 +150,7 @@ const server = http.createServer(async (req, res) => {
 
     /* ---- 公开接口：只有哈希承诺，永不包含密文 ---- */
     if (p === '/api/health' && req.method === 'GET')
-      return send(res, 200, { ok: true, version: 2, owners: owners.size,
+      return send(res, 200, { ok: true, version: 3, owners: owners.size,
         entries: Array.from(owners.values()).reduce((s, o) => s + o.chain.length, 0),
         merkleRoot: merkleRoot(), anchorCount: anchors.length, anchorHead });
     if (p === '/api/anchors' && req.method === 'GET')
@@ -208,15 +232,24 @@ const server = http.createServer(async (req, res) => {
         verifier: me.verifier, seq: me.seq, head: me.head, count: me.chain.length });
 
     if (p === '/api/entries' && req.method === 'POST') {
-      if (data.seq !== me.seq + 1) return send(res, 409, { error: '序号不连续，账本可能已在别处更新' });
-      if (data.prevHash !== me.head) return send(res, 409, { error: '前序哈希不匹配' });
-      const calc = sha([data.seq, data.prevHash, me.fp, data.cipher, data.bookTag, data.ts].join('|'));
-      if (calc !== data.hash) return send(res, 400, { error: '记录哈希不匹配' });
-      if (!verifySig(me.pubSign, data.hash, data.sig)) return send(res, 401, { error: '记录签名无效' });
-      if (typeof data.cipher !== 'string' || data.cipher.length > 200000) return send(res, 400, { error: '密文格式无效' });
-      append({ t: 'entry', fp: me.fp, seq: data.seq, prevHash: data.prevHash, hash: data.hash,
-        cipher: data.cipher, sig: data.sig, bookTag: clean(data.bookTag), ts: Number(data.ts) || Date.now() });
-      return send(res, 201, { ok: true, seq: me.seq, head: me.head, merkleRoot: merkleRoot() });
+      const result = appendEntry(me, data);
+      if (result.status === 'error') return send(res, result.code, { error: result.error });
+      return send(res, result.status === 'accepted' ? 201 : 200,
+        { ok: true, existing: result.status === 'existing', seq: me.seq, head: me.head, merkleRoot: merkleRoot() });
+    }
+    /* 离线队列批量恢复：逐条校验、顺序追加；hash 已存在则幂等确认。
+       中途遇到分叉时返回已经处理的结果，客户端可安全落盘后再暂停。 */
+    if (p === '/api/entries/sync' && req.method === 'POST') {
+      if (!Array.isArray(data.entries) || data.entries.length < 1 || data.entries.length > 50)
+        return send(res, 400, { error: '同步批次应包含 1–50 条记录' });
+      const results = [];
+      for (const entry of data.entries) {
+        const result = appendEntry(me, entry);
+        if (result.status === 'error')
+          return send(res, result.code, { error: result.error, results, seq: me.seq, head: me.head, conflict: result.code === 409 });
+        results.push(result);
+      }
+      return send(res, 200, { ok: true, results, seq: me.seq, head: me.head, merkleRoot: merkleRoot() });
     }
     if (p === '/api/entries' && req.method === 'GET')
       return send(res, 200, { entries: me.chain, head: me.head, seq: me.seq });
@@ -253,4 +286,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, '0.0.0.0', () => console.log('简记联网账本 running on port ' + PORT));
+server.listen(PORT, process.env.HOST || '127.0.0.1', () => console.log('简记联网账本 running on ' + (process.env.HOST || '127.0.0.1') + ':' + PORT));

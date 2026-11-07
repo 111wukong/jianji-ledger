@@ -1,0 +1,15 @@
+{
+  "name": "简记 · 离线优先账本",
+  "short_name": "简记",
+  "description": "断网也能记、联网自动同步的端到端加密不可变账本。",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#faf9f5",
+  "theme_color": "#12141f",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

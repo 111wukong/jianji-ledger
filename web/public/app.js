@@ -1,6 +1,6 @@
 'use strict';
-/* 简记 · 联网不可变账本（最小闭环）
-   明文永远不离开浏览器；服务端只见密文、标签与哈希承诺。 */
+/* 简记 · 离线优先的统一不可变账本。
+   明文只在当前页面内存中出现；IndexedDB 与服务端都只保存密文、签名和哈希。 */
 
 const WORDS = `abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve
 acid acoustic acquire across act action actor actress actual adapt add addict address adjust admit
@@ -10,7 +10,7 @@ amateur amazing among amount amused analyst anchor ancient anger angle angry ani
 annual another answer antique anxiety any apart apology appear apple approve april arch arctic
 area arena argue arm armed armor army around arrange arrest arrive arrow art artist artwork
 aspect asset assist assume asthma athlete atom attack attend attitude attract auction audit august
-aunt author auto autumn average avocado avoid awake aware away awesome awful awkward axis baby
+aunt author auto autumn average avocado avoid awake aware awesome awful awkward axis baby
 bachelor bacon badge bag balance balcony ball bamboo banana banner bar barely bargain barrel
 base basic basket battle beach bean beauty because become beef before begin behave behind
 believe below belt bench benefit best betray better between beyond bicycle bid bike bind
@@ -27,14 +27,14 @@ const dec = b => new TextDecoder().decode(b);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const today = () => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0'); };
-const fmt = c => '¥' + (c / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmt = c => '¥' + (Number(c || 0) / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const shortHash = (s, n) => esc(String(s || '').slice(0, n || 14));
+const GENESIS = '0'.repeat(64);
 function b64(buf) { const a = new Uint8Array(buf); let s = ''; for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]); return btoa(s); }
 function unb64(s) { return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
 const subtle = () => crypto.subtle;
 async function sha256hex(s) { const d = await subtle().digest('SHA-256', enc(s)); return Array.from(new Uint8Array(d), x => x.toString(16).padStart(2,'0')).join(''); }
 async function aesKey(raw, usages, extractable) { return subtle().importKey('raw', raw, 'AES-GCM', !!extractable, usages || ['encrypt','decrypt']); }
-/* 定长填充：所有密文长度对齐到 512 字节的整数倍，
-   避免记录大小泄露摘要长度。尾部空格会被 JSON.parse 忽略，旧数据仍可读。 */
 async function aesEnc(key, obj) {
   const raw = enc(JSON.stringify(obj)), block = 512;
   const pad = block - (raw.length % block);
@@ -60,12 +60,9 @@ const importDhPriv = id => subtle().importKey('jwk', id.priv.dh, DH_ALG, false, 
 const importDhPub = jwk => subtle().importKey('jwk', jwk, DH_ALG, false, []);
 const importSignPub = jwk => subtle().importKey('jwk', jwk, SIG_ALG, false, ['verify']);
 
-/* 助记词由 CSPRNG 生成，自带 128 bit 熵，不是低熵口令：
-   这里用 HKDF 做密钥分离即可，无需慢 KDF 抗离线爆破。 */
 async function derive(mnemonic) {
   const base = await subtle().importKey('raw', enc(mnemonic), 'HKDF', false, ['deriveBits']);
-  const bits = await subtle().deriveBits({ name:'HKDF', hash:'SHA-256',
-    salt:enc('jianji.cloud.v1'), info:enc('master-keys') }, base, 512);
+  const bits = await subtle().deriveBits({ name:'HKDF', hash:'SHA-256', salt:enc('jianji.cloud.v1'), info:enc('master-keys') }, base, 512);
   const master = await aesKey(new Uint8Array(bits, 0, 32), ['encrypt','decrypt']);
   const hkBase = await subtle().importKey('raw', new Uint8Array(bits, 32, 32), 'HKDF', false, ['deriveKey']);
   return { mnemonic, master, hkBase, verifier: await sha256hex('jianji-verifier|' + mnemonic) };
@@ -96,7 +93,6 @@ function cacheIdentity(id) {
     fp:id.fp, pubSign:id.pubSign, pubDh:id.pubDh })); } catch (e) {}
 }
 function cachedIdentity() { try { return JSON.parse(localStorage.getItem(ID_CACHE) || 'null'); } catch (e) { return null; } }
-/* 服务端可能整体重建：先查在线身份，查不到就用本机/账本文件里的加密密钥包离线恢复 */
 async function restoreIdentity(m) {
   const keys = await derive(m);
   let r = null;
@@ -104,7 +100,7 @@ async function restoreIdentity(m) {
   catch (e) {
     const c = cachedIdentity();
     if (!c || c.verifier !== keys.verifier)
-      throw new Error('没有找到该助记词对应的身份：请检查抄写，或先导入之前导出的加密账本文件');
+      throw new Error(e.network ? '离线恢复需要使用这台设备保存过的身份；也可以先导入加密账本备份' : '没有找到该助记词对应的身份：请检查抄写，或先导入之前导出的加密账本文件');
     r = c;
   }
   let priv;
@@ -120,125 +116,359 @@ async function login(id) {
 }
 
 let TOKEN = '';
+const ST = {
+  id:null, me:{ seq:0, head:GENESIS }, entries:[], outbox:[], plain:[], tab:'overview', book:'个人账',
+  books:['个人账','公司资金'], mode:'create', tmp:null, anchors:null, proof:null, grants:null, shared:null,
+  filter:{ text:'', book:'all', status:'all' }, writing:false, syncing:false, syncAgain:false,
+  sync:{ online:navigator.onLine, status:navigator.onLine ? 'idle' : 'offline', error:'', conflict:'', lastSync:0 }
+};
+
 async function api(path, method, data, noAuth) {
   const headers = { 'Content-Type':'application/json' };
   if (!noAuth && TOKEN) headers.Authorization = 'Bearer ' + TOKEN;
-  const r = await fetch(path, { method: method || 'GET', headers, body: data ? JSON.stringify(data) : undefined });
+  let r;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try { r = await fetch(path, { method:method || 'GET', headers, body:data ? JSON.stringify(data) : undefined, signal:controller.signal }); }
+    finally { clearTimeout(timer); }
+  } catch (e) {
+    ST.sync.online = false; ST.sync.status = 'offline'; paintSync();
+    const err = new Error('当前无法连接服务端，账目仍会安全保存在本机'); err.network = true; throw err;
+  }
   let j; try { j = await r.json(); } catch (e) { throw new Error('服务端返回异常'); }
-  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  if (!r.ok) { const err = new Error(j.error || ('HTTP ' + r.status)); err.status = r.status; err.data = j; throw err; }
+  ST.sync.online = true;
   return j;
 }
+async function ensureSession() {
+  if (!ST.id) throw new Error('请先恢复身份');
+  if (TOKEN) return;
+  const r = await login(ST.id); TOKEN = r.token;
+}
+async function authed(path, method, data) {
+  await ensureSession();
+  try { return await api(path, method, data); }
+  catch (err) {
+    if (err.status !== 401) throw err;
+    TOKEN = ''; await ensureSession();
+    return api(path, method, data);
+  }
+}
+
 function toast(msg, kind) {
-  const el = $('#toast'); el.textContent = msg;
-  el.className = 'toast show' + (kind === 'err' ? ' err' : '');
-  clearTimeout(toast._t); toast._t = setTimeout(() => el.className = 'toast', 3200);
+  const el = $('#toast'); if (!el) return;
+  el.textContent = msg; el.className = 'toast show' + (kind === 'err' ? ' err' : kind === 'warn' ? ' warn' : '');
+  clearTimeout(toast._t); toast._t = setTimeout(() => el.className = 'toast', 4200);
 }
 function modal(html) {
   const d = document.createElement('div'); d.className = 'modal-bg';
-  d.innerHTML = '<div class="modal">' + html + '</div>';
+  d.innerHTML = '<div class="modal" role="dialog" aria-modal="true">' + html + '</div>';
   d.addEventListener('click', e => { if (e.target === d || e.target.dataset.act === 'close-modal') d.remove(); });
   document.body.appendChild(d); return d;
 }
 async function copy(text) { try { await navigator.clipboard.writeText(text); toast('已复制'); } catch (e) { toast('复制失败，请手动选中', 'err'); } }
-
-const ST = { id:null, me:null, entries:[], plain:[], tab:'ledger', book:'公司资金',
-  books:['公司资金','个人账'], mode:'create', tmp:null, anchors:null, grants:null, shared:null, verifyFp:'' };
-
-/* 常驻安全指示器：ui-ux-pro-max 明确要求安全类界面必须给出可见状态 */
-function statusBar(extra) {
-  return '<div class="statusbar">' +
-    '<span class="s-item"><i class="dot live"></i>END-TO-END ENCRYPTED</span>' +
-    '<span class="s-item">APPEND-ONLY</span>' +
-    '<span class="s-item">HASH-COMMITMENT ONLY</span>' +
-    '<span class="s-item"><i class="dot live"></i><b>' + (extra || 'CLIENT-SIDE KEYS') + '</b></span></div>';
-}
-
-/* ---------------- 身份入口 ---------------- */
-function viewWelcome() {
-  const wordsHtml = ST.tmp ? '<div class="words">' + ST.tmp.split(' ').map((w,i) =>
-    '<div class="word"><b>' + (i+1) + '</b>' + esc(w) + '</div>').join('') + '</div>' : '';
-  $('#app').innerHTML = '<div class="wrap"><div class="top"><div class="brand-mark">记</div>' +
-    '<div><div class="brand-t">简记 · 联网账本</div><div class="brand-s">IDENTITY = KEY / APPEND ONLY / HASH COMMITMENT</div></div></div>' +
-    statusBar() +
-    '<div class="card"><div class="card-h"><div><div class="card-t">这账本怎么保证改不了</div></div>' +
-      '<span class="tag info">最小闭环</span></div>' +
-      '<div class="card-s">明文在你浏览器里用助记词派生的密钥加密后才上传；服务端只提供追加写入，没有任何改删接口，也看不到内容。' +
-      '对外公开的只有每条记录的 SHA-256 哈希链与全局 Merkle 根，任何人都能独立校验，却拿不到一个字节的账目内容。</div></div>' +
-    (ST.tmp ? '<div class="card"><div class="card-h"><div class="card-t">抄下这 16 个词</div><span class="tag warn">唯一恢复方式</span></div>' +
-      wordsHtml +
-      '<div class="note warn">这 16 个词就是你的身份和全部账本的钥匙：登录、查看、记账、授权全靠它。服务端不保存明文，丢了没有任何人能帮你找回。请离线抄写并妥善保管。</div>' +
-      '<div class="row"><button class="btn primary" data-act="confirm-words">我已抄写，创建身份</button>' +
-      '<button class="btn" data-act="copy-words">复制助记词</button><button class="btn" data-act="cancel-words">返回</button></div></div>'
-    : '<div class="grid2"><div class="card"><div class="card-h"><div class="card-t">第一次使用</div></div>' +
-      '<div class="card-s">生成一套全新的助记词与密钥对。服务端只登记公钥，不保存任何密码。</div>' +
-      '<div style="margin-top:14px"><button class="btn primary" data-act="gen-words">生成我的专属密钥</button></div></div>' +
-      '<div class="card"><div class="card-h"><div class="card-t">已有助记词</div></div>' +
-      '<div class="field"><label>用助记词恢复身份（16 个词，空格分隔）</label>' +
-      '<textarea class="inp" id="restore-words" placeholder="abandon ability able ..."></textarea></div>' +
-      '<button class="btn primary" data-act="restore">恢复并登录</button></div></div>') +
-    '<div class="card"><div class="card-h"><div class="card-t">公开账本状态</div>' +
-      '<button class="btn sm" data-act="public-check">查看公开哈希</button></div>' +
-      '<div class="card-s" id="public-status">正在读取公开锚…</div></div></div>';
-  loadPublicStatus();
-}
-async function loadPublicStatus() {
-  try {
-    const a = await api('/api/anchors', 'GET', null, false);
-    ST.anchors = a;
-    const el = $('#public-status'); if (!el) return;
-    el.innerHTML = '全局 Merkle 根 <span class="mono" style="color:var(--accent)">' + esc(a.merkleRoot.slice(0,32)) + '…</span><br>' +
-      '已登记身份 ' + a.owners.length + ' 个 · 公开内容仅含哈希、序号、时间戳与签名，不含任何密文。';
-  } catch (e) { const el = $('#public-status'); if (el) el.textContent = '无法连接服务端：' + e.message; }
-}
-
-/* ---------------- 主界面 ---------------- */
-function viewMain() {
-  const tabs = [['ledger','我的账本'],['verify','公开验证'],['grants','授权查看'],['identity','身份与备份']];
-  $('#app').innerHTML = '<div class="wrap"><div class="top"><div class="brand-mark">记</div>' +
-    '<div><div class="brand-t">简记 · 联网账本</div><div class="brand-s">身份指纹 <span class="mono">' + esc(ST.id.fp) + '</span></div></div>' +
-    '<div class="spacer"></div><span class="tag good">链高 ' + (ST.me ? ST.me.seq : 0) + '</span>' +
-    '<button class="btn sm" data-act="theme">切换主题</button><button class="btn sm" data-act="logout">退出</button></div>' +
-    statusBar('CHAIN HEIGHT ' + (ST.me ? ST.me.seq : 0)) +
-    '<div class="tabs">' + tabs.map(t => '<button data-act="tab" data-v="' + t[0] + '" class="' + (ST.tab === t[0] ? 'on' : '') + '">' + t[1] + '</button>').join('') + '</div>' +
-    '<div id="main-content"></div></div>';
-  const v = { ledger:viewLedger, verify:viewVerify, grants:viewGrants, identity:viewIdentity }[ST.tab];
-  $('#main-content').innerHTML = v();
-}
-function viewLedger() {
-  const list = ST.plain.slice().reverse();
-  const rows = list.length ? list.map(p => '<div class="list-row"><div class="lr-main">' +
-    '<div class="lr-t">' + esc(p.note || p.type) + (p.party ? ' <span class="tag">' + esc(p.party) + '</span>' : '') + '</div>' +
-    '<div class="lr-s">' + esc(p.date) + ' · ' + esc(p.book) + ' · ' + (p.voucher || '—') + ' · #' + p.seq + ' 已封存</div></div>' +
-    '<div class="lr-v" style="color:' + (p.type === 'income' ? 'var(--income)' : 'var(--text)') + '">' +
-    (p.type === 'income' ? '+' : '-') + fmt(p.amount) + '</div></div>').join('')
-    : '<div class="empty">还没有记录。记下的第一笔就会进入不可变账本。</div>';
-  return '<div class="kpis">' +
-    '<div class="kpi"><div class="l">链上记录</div><div class="v">' + (ST.me ? ST.me.seq : 0) + '</div></div>' +
-    '<div class="kpi"><div class="l">累计增加</div><div class="v" style="color:var(--income)">' + fmt(list.filter(x => x.type === 'income').reduce((s,x) => s+x.amount,0)) + '</div></div>' +
-    '<div class="kpi"><div class="l">累计减少</div><div class="v" style="color:var(--expense)">' + fmt(list.filter(x => x.type === 'expense').reduce((s,x) => s+x.amount,0)) + '</div></div>' +
-    '<div class="kpi"><div class="l">账本头</div><div class="v mono" style="font-size:12px">' + esc((ST.me && ST.me.head || '').slice(0,14)) + '…</div></div></div>' +
-    '<div class="grid2"><div class="card"><div class="card-h"><div class="card-t">记一笔（本地加密后上传）</div>' +
-      '<span class="tag info">只追加</span></div>' +
-      '<div class="field"><label>账本</label><select class="inp" id="f-book">' + ST.books.map(b => '<option' + (b === ST.book ? ' selected' : '') + '>' + esc(b) + '</option>').join('') + '</select></div>' +
-      '<div class="row" style="margin-bottom:12px"><button class="btn sm" data-act="add-book">+ 新增账本</button></div>' +
-      '<div class="field"><label>方向</label><select class="inp" id="f-type"><option value="expense">减少 / 支出</option><option value="income">增加 / 收入</option></select></div>' +
-      '<div class="field"><label>金额（元）</label><input class="inp" id="f-amount" inputmode="decimal" placeholder="0.00"></div>' +
-      '<div class="field"><label>摘要</label><input class="inp" id="f-note" placeholder="例如：公司拨入备用金"></div>' +
-      '<div class="grid2" style="gap:10px"><div class="field"><label>往来 / 经办</label><input class="inp" id="f-party" placeholder="选填"></div>' +
-      '<div class="field"><label>凭证号</label><input class="inp" id="f-voucher" placeholder="选填"></div></div>' +
-      '<div class="field"><label>日期</label><input class="inp" type="date" id="f-date" value="' + today() + '"></div>' +
-      '<button class="btn primary" data-act="add-entry">签名并记入账本</button>' +
-      '<div class="note">记录一经提交就无法修改或删除。记错了按财务规范做一笔反向冲销，两笔都永久留痕。</div></div>' +
-    '<div class="card"><div class="card-h"><div class="card-t">已解密的账目</div><span class="tag good">仅你可见</span></div>' + rows + '</div></div>';
+function downloadJSON(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type:'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 800);
 }
 function savedAnchors() { try { return JSON.parse(localStorage.getItem('jianji.anchors.v1') || '[]'); } catch (e) { return []; } }
 function writeSavedAnchors(a) { try { localStorage.setItem('jianji.anchors.v1', JSON.stringify(a)); } catch (e) {} }
+
+function syncLabel() {
+  if (ST.syncing) return '正在同步';
+  if (ST.sync.conflict) return '同步已暂停';
+  if (!navigator.onLine || !ST.sync.online || ST.sync.status === 'offline') return '离线可用';
+  if (ST.sync.status === 'error') return '同步待重试';
+  if (ST.outbox.length) return ST.outbox.length + ' 笔待同步';
+  return ST.sync.lastSync ? '已同步' : '已连接';
+}
+function syncKind() {
+  if (ST.sync.conflict || ST.sync.status === 'error') return 'bad';
+  if (ST.syncing) return 'working';
+  if (!navigator.onLine || !ST.sync.online || ST.outbox.length) return 'pending';
+  return 'good';
+}
+function paintSync() {
+  $$('[data-sync-label]').forEach(el => { el.textContent = syncLabel(); });
+  $$('[data-sync-dot]').forEach(el => { el.className = 'status-dot ' + syncKind(); });
+  $$('[data-pending-count]').forEach(el => { el.textContent = String(ST.outbox.length); });
+}
+async function refreshLocal() {
+  if (!ST.id) return;
+  const rows = await LedgerStore.all(ST.id.fp);
+  ST.entries = rows;
+  ST.outbox = rows.filter(r => r.pending).map(r => r.entry).sort((a,b) => a.seq - b.seq);
+  const ordered = rows.map(r => r.entry).sort((a,b) => a.seq - b.seq);
+  const last = ordered[ordered.length - 1];
+  ST.me = { fp:ST.id.fp, seq:last ? Number(last.seq) : 0, head:last ? last.hash : GENESIS };
+  const tagMap = {};
+  for (const b of ST.books) tagMap[await bookTag(ST.id, b)] = b;
+  const pendingHashes = new Set(ST.outbox.map(e => e.hash));
+  const plain = [];
+  for (const row of rows) {
+    const e = row.entry, b = tagMap[e.bookTag]; if (!b) continue;
+    try {
+      const p = await aesDec(await bookKey(ST.id, b), e.cipher);
+      plain.push(Object.assign({}, p, { seq:e.seq, hash:e.hash, prevHash:e.prevHash, book:b, pending:pendingHashes.has(e.hash) }));
+    } catch (err) { /* 其他账本或损坏记录不暴露明文，也不阻塞可用记录 */ }
+  }
+  ST.plain = plain.sort((a,b) => a.seq - b.seq);
+  paintSync();
+}
+async function startIdentity(id) {
+  ST.id = id; TOKEN = ''; ST.tmp = null; ST.anchors = null; ST.proof = null; ST.grants = null; ST.shared = null;
+  ST.sync.conflict = ''; ST.sync.error = ''; ST.tab = 'overview';
+  cacheIdentity(id);
+  ST.books = await LedgerStore.getMeta('books:' + id.fp, ['个人账','公司资金']);
+  if (!ST.books.includes(ST.book)) ST.book = ST.books[0];
+  ST.sync.lastSync = await LedgerStore.getMeta('lastSync:' + id.fp, 0);
+  await refreshLocal(); render();
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  synchronize();
+}
+async function adoptServer(serverEntries) {
+  const cachedSynced = ST.entries.filter(r => !r.pending).map(r => r.entry);
+  const prefix = SyncCore.prefixProblem(cachedSynced, serverEntries);
+  if (prefix) {
+    const err = new Error('服务端历史与本机已确认前缀不一致，已停止同步，请先导出本机密文备份'); err.conflict = true; throw err;
+  }
+  const plan = SyncCore.assessOutbox(serverEntries, ST.outbox);
+  if (plan.conflict) {
+    const err = new Error('检测到另一段账本历史：另一台设备可能已离线记账。为保护只追加历史，系统不会自动覆盖或合并'); err.conflict = true; err.detail = plan.conflict; throw err;
+  }
+  for (const e of plan.existing) await LedgerStore.markSynced(ST.id.fp, e);
+  await LedgerStore.replaceSynced(ST.id.fp, serverEntries);
+  return plan.pending;
+}
+async function applySyncResults(results) {
+  for (const result of results || []) {
+    if (result.status !== 'accepted' && result.status !== 'existing') continue;
+    const entry = ST.outbox.find(e => e.hash === result.hash);
+    if (entry) await LedgerStore.markSynced(ST.id.fp, entry);
+  }
+  if (results && results.length) await refreshLocal();
+}
+async function refreshAncillary() {
+  try {
+    const [anchors, proof, grants, shared] = await Promise.all([
+      api('/api/anchors', 'GET', null, false), api('/api/anchor-proof', 'GET', null, false),
+      authed('/api/grants', 'GET'), authed('/api/shared', 'GET')
+    ]);
+    ST.anchors = anchors; ST.proof = proof; ST.grants = grants; ST.shared = shared.shared;
+  } catch (e) { /* 核心账目已同步时，辅助信息失败不反向标记为失败 */ }
+}
+async function synchronize() {
+  if (!ST.id) return;
+  if (ST.syncing) { ST.syncAgain = true; return; }
+  if (!navigator.onLine) { ST.sync.online = false; ST.sync.status = 'offline'; paintSync(); return; }
+  ST.syncing = true; ST.syncAgain = false; ST.sync.status = 'syncing'; ST.sync.error = ''; paintSync();
+  try {
+    for (let guard = 0; guard < 20; guard++) {
+      await refreshLocal();
+      const r = await authed('/api/entries', 'GET');
+      const pending = await adoptServer(r.entries);
+      await refreshLocal();
+      if (!pending.length) break;
+      const plan = SyncCore.uploadBatch(r.entries, ST.outbox, 50);
+      if (plan.conflict) { const err = new Error('离线队列与服务端历史不连续，同步已暂停'); err.conflict = true; throw err; }
+      if (!plan.batch.length) break;
+      try { await authed('/api/entries/sync', 'POST', { entries:plan.batch }); }
+      catch (err) { if (err.data && err.data.results) await applySyncResults(err.data.results); throw err; }
+      await refreshLocal();
+    }
+    await refreshAncillary();
+    await refreshLocal();
+    ST.sync.online = true; ST.sync.conflict = ''; ST.sync.status = ST.outbox.length ? 'idle' : 'synced';
+    ST.sync.lastSync = Date.now();
+    await LedgerStore.setMeta('lastSync:' + ST.id.fp, ST.sync.lastSync);
+  } catch (err) {
+    if (err.conflict || (err.data && err.data.conflict)) {
+      ST.sync.conflict = err.message; ST.sync.status = 'conflict';
+    } else if (err.network || !navigator.onLine) {
+      ST.sync.online = false; ST.sync.status = 'offline';
+    } else {
+      ST.sync.error = err.message; ST.sync.status = 'error';
+    }
+  } finally {
+    ST.syncing = false;
+    try { await refreshLocal(); } catch (e) { ST.sync.error = e.message; }
+    render();
+    if (ST.syncAgain && navigator.onLine && !ST.sync.conflict) { ST.syncAgain = false; setTimeout(synchronize, 120); }
+  }
+}
+
+async function addEntry(preset) {
+  if (ST.writing || !ST.id) return;
+  ST.writing = true;
+  try {
+    let plain;
+    if (preset) plain = preset;
+    else {
+      const amount = Math.round(Number(String($('#f-amount').value).replace(/[^\d.]/g,'')) * 100);
+      if (!amount || amount <= 0) throw new Error('请输入有效金额');
+      plain = { type:$('#f-type').value, amount, book:$('#f-book').value, date:$('#f-date').value || today(),
+        note:$('#f-note').value.trim(), party:$('#f-party').value.trim(), voucher:$('#f-voucher').value.trim() };
+    }
+    await refreshLocal();
+    const book = plain.book;
+    const cipher = await aesEnc(await bookKey(ST.id, book), plain);
+    const tag = await bookTag(ST.id, book);
+    const seq = ST.me.seq + 1, prevHash = ST.me.head, ts = Date.now();
+    const hash = await sha256hex([seq, prevHash, ST.id.fp, cipher, tag, ts].join('|'));
+    const sig = b64(await subtle().sign({ name:'ECDSA', hash:'SHA-256' }, await importSignPriv(ST.id), enc(hash)));
+    const entry = { seq, prevHash, hash, cipher, sig, bookTag:tag, ts };
+    await LedgerStore.put(ST.id.fp, entry, true);
+    await refreshLocal(); ST.writing = false; render(true);
+    toast(navigator.onLine && ST.sync.online ? '已加密封存在本机，正在自动同步' : '已离线封存，恢复联网后自动上传');
+  } finally { ST.writing = false; }
+  synchronize();
+}
+
+/* ---------------- 统一界面 ---------------- */
+function brand(compact) {
+  return '<div class="brand ' + (compact ? 'compact' : '') + '"><span class="brand-symbol" aria-hidden="true"><i></i><i></i><i></i></span>' +
+    '<span><b>简记</b><small>JIANJI LEDGER</small></span></div>';
+}
+function viewWelcome() {
+  const wordsHtml = ST.tmp ? '<div class="words">' + ST.tmp.split(' ').map((w,i) =>
+    '<div class="word"><b>' + String(i+1).padStart(2,'0') + '</b><span>' + esc(w) + '</span></div>').join('') + '</div>' : '';
+  let auth;
+  if (ST.tmp) {
+    auth = '<div class="eyebrow">最后一步</div><h2>抄下你的 16 个助记词</h2>' +
+      '<p class="muted">它们是身份与账本的唯一恢复凭据。服务端不保存明文，也无法替你找回。</p>' + wordsHtml +
+      '<label class="check-line"><input type="checkbox" id="words-ack"> 我已离线抄写，并明白丢失后无法找回</label>' +
+      '<div class="button-stack"><button class="btn primary wide" data-act="confirm-words">创建身份并进入账本</button>' +
+      '<div class="row"><button class="btn secondary" data-act="copy-words">复制助记词</button><button class="btn ghost" data-act="cancel-words">返回</button></div></div>';
+  } else if (ST.mode === 'restore') {
+    auth = '<div class="eyebrow">欢迎回来</div><h2>恢复你的身份</h2><p class="muted">输入 16 个助记词。已使用过的设备即使断网，也能解开本机账本。</p>' +
+      '<div class="field"><label for="restore-words">助记词（空格分隔）</label><textarea class="inp" id="restore-words" rows="4" autocomplete="off" spellcheck="false" placeholder="abandon ability able ..."></textarea></div>' +
+      '<button class="btn primary wide" data-act="restore">恢复并进入账本</button>' +
+      '<button class="text-btn" data-act="mode" data-v="create">第一次使用？创建新身份</button>';
+  } else {
+    auth = '<div class="eyebrow">开始使用</div><h2>你的账本，由你的密钥掌控</h2>' +
+      '<p class="muted">不需要邮箱或手机号。生成助记词后，即可离线记账；联网时身份会自动登记，记录会自动同步。</p>' +
+      '<div class="auth-facts"><div><b>本机先行</b><span>记录先加密封存，网络不是前提</span></div><div><b>恢复自动</b><span>联网后按顺序上传，重复提交会去掉</span></div><div><b>历史可查</b><span>哈希链、签名与外部锚点独立验证</span></div></div>' +
+      '<button class="btn primary wide" data-act="gen-words">生成我的专属密钥</button>' +
+      '<button class="text-btn" data-act="mode" data-v="restore">已有助记词？恢复身份</button>';
+  }
+  $('#app').innerHTML = '<div class="auth-shell"><section class="auth-story">' + brand() +
+    '<div class="story-copy"><div class="eyebrow">离线优先 · 自动同步 · 只追加</div><h1>断网也能记，<br>联网自然同步。</h1>' +
+    '<p>一套账本，一种体验。无论网络是否可用，记录都会先在你的设备上完成加密、签名和封存。</p></div>' +
+    '<div class="story-proof"><span>端到端加密</span><span>本机待同步队列</span><span>公开哈希验证</span></div>' +
+    '<div class="public-inline" id="public-status">正在读取公开账本状态…</div></section>' +
+    '<section class="auth-panel"><div class="auth-card">' + auth + '</div><p class="auth-foot">明文不离开浏览器 · 没有修改或删除接口</p></section></div>';
+  loadPublicStatus();
+}
+async function loadPublicStatus() {
+  const el = $('#public-status'); if (!el) return;
+  if (!navigator.onLine) { el.textContent = '当前离线：仍可创建身份并开始记账'; return; }
+  try {
+    const a = await api('/api/anchors', 'GET', null, false); ST.anchors = a;
+    const target = $('#public-status'); if (!target) return;
+    target.innerHTML = '<span class="status-dot good"></span> 服务可用 · ' + a.owners.length + ' 个公开身份 · Merkle 根 ' + shortHash(a.merkleRoot, 12) + '…';
+  } catch (e) { const target = $('#public-status'); if (target) target.textContent = '服务暂不可达：仍可离线创建身份并记账'; }
+}
+
+const NAV = [
+  ['overview','总览','01'], ['entry','记一笔','02'], ['records','账目明细','03'],
+  ['verify','公开验证','04'], ['grants','共享授权','05'], ['identity','身份备份','06']
+];
+const PAGE_COPY = {
+  overview:['工作台','账目与同步状态，一屏看清'], entry:['记一笔','先保存在本机，再按顺序同步'],
+  records:['账目明细','每一笔都有序号、哈希与同步状态'], verify:['公开验证','只公开承诺，不公开账目内容'],
+  grants:['共享授权','只把指定账本的读取能力交给指定身份'], identity:['身份与备份','管理助记词、本机密文与迁移文件']
+};
+function syncPill(button) {
+  return '<' + (button ? 'button data-act="sync-now"' : 'div') + ' class="sync-pill ' + syncKind() + '">' +
+    '<span class="status-dot ' + syncKind() + '" data-sync-dot></span><span data-sync-label>' + esc(syncLabel()) + '</span>' +
+    (button ? '<span class="sync-action">立即同步</span>' : '') + '</' + (button ? 'button' : 'div') + '>';
+}
+function viewMain() {
+  const copy = PAGE_COPY[ST.tab] || PAGE_COPY.overview;
+  $('#app').innerHTML = '<div class="app-shell"><aside class="sidebar">' + brand() +
+    '<nav class="side-nav" aria-label="主导航">' + NAV.map(n => '<button data-act="tab" data-v="' + n[0] + '" class="nav-item ' + (ST.tab === n[0] ? 'active' : '') + '"><span class="nav-num">' + n[2] + '</span><span>' + n[1] + '</span></button>').join('') + '</nav>' +
+    '<div class="sidebar-bottom"><div class="security-note"><span class="status-dot good"></span><div><b>本机密文存储</b><small>明文仅在当前页面内存中</small></div></div>' +
+    '<div class="identity-mini"><span>身份指纹</span><code>' + esc(ST.id.fp) + '</code></div>' +
+    '<div class="sidebar-actions"><button class="text-btn" data-act="theme">切换主题</button><button class="text-btn" data-act="logout">锁定并退出</button></div></div></aside>' +
+    '<section class="workspace"><header class="topbar"><div class="mobile-brand">' + brand(true) + '</div>' +
+    '<div class="page-heading"><span>' + esc(copy[0]) + '</span><p>' + esc(copy[1]) + '</p></div>' + syncPill(true) + '</header>' +
+    '<main class="page" id="main-content"></main></section>' +
+    '<nav class="mobile-nav" aria-label="移动导航">' + NAV.map(n => '<button data-act="tab" data-v="' + n[0] + '" class="' + (ST.tab === n[0] ? 'active' : '') + '"><small>' + n[2] + '</small><span>' + n[1].replace('账目','').replace('身份','') + '</span></button>').join('') + '</nav></div>';
+  const views = { overview:viewOverview, entry:viewEntry, records:viewRecords, verify:viewVerify, grants:viewGrants, identity:viewIdentity };
+  $('#main-content').innerHTML = views[ST.tab]();
+  paintSync();
+}
+function syncNotice() {
+  if (ST.sync.conflict) return '<div class="notice danger"><b>同步已暂停</b><p>' + esc(ST.sync.conflict) + '</p><span>请先在「身份备份」导出本机加密账本。不要清空浏览器数据，也不要在另一设备继续写入。</span></div>';
+  if (!navigator.onLine || !ST.sync.online || ST.sync.status === 'offline') return '<div class="notice offline"><b>当前离线，记账不受影响</b><p>新记录会加密保存在这台设备，并进入待同步队列。恢复网络后无需手动补录。</p></div>';
+  if (ST.sync.status === 'error') return '<div class="notice warning"><b>本次同步未完成</b><p>' + esc(ST.sync.error || '将在下次连接时自动重试') + '</p><span>记录仍保存在本机，不会丢失或重复上传。</span></div>';
+  if (ST.outbox.length) return '<div class="notice pending"><b>' + ST.outbox.length + ' 笔记录等待上传</b><p>它们已经完成本机加密与签名，将按账本顺序自动同步。</p></div>';
+  return '<div class="notice success"><b>本机与服务端一致</b><p>所有已解密记录均已同步。最近确认：' + (ST.sync.lastSync ? new Date(ST.sync.lastSync).toLocaleString('zh-CN') : '本次会话') + '</p></div>';
+}
+function totals() {
+  const income = ST.plain.filter(x => x.type === 'income').reduce((s,x) => s + x.amount, 0);
+  const expense = ST.plain.filter(x => x.type !== 'income').reduce((s,x) => s + x.amount, 0);
+  return { income, expense, net:income - expense };
+}
+function entryForm() {
+  return '<form class="entry-form" id="entry-form"><div class="form-grid"><div class="field span-2"><label for="f-amount">金额</label><div class="amount-input"><span>¥</span><input class="inp" id="f-amount" inputmode="decimal" autocomplete="off" placeholder="0.00" required></div></div>' +
+    '<div class="field"><label for="f-type">收支方向</label><select class="inp" id="f-type"><option value="expense">支出 / 减少</option><option value="income">收入 / 增加</option></select></div>' +
+    '<div class="field"><label for="f-date">日期</label><input class="inp" type="date" id="f-date" value="' + today() + '"></div>' +
+    '<div class="field span-2"><label for="f-note">摘要</label><input class="inp" id="f-note" maxlength="120" placeholder="这笔钱因何发生？"></div>' +
+    '<div class="field"><label for="f-book">所属账本</label><select class="inp" id="f-book">' + ST.books.map(b => '<option' + (b === ST.book ? ' selected' : '') + '>' + esc(b) + '</option>').join('') + '</select></div>' +
+    '<div class="field"><label for="f-party">往来 / 经办</label><input class="inp" id="f-party" maxlength="80" placeholder="选填"></div>' +
+    '<div class="field"><label for="f-voucher">凭证号</label><input class="inp" id="f-voucher" maxlength="80" placeholder="选填"></div>' +
+    '<div class="field book-add"><label>&nbsp;</label><button type="button" class="btn ghost" data-act="add-book">新增账本</button></div></div>' +
+    '<div class="form-footer"><span>提交后不可修改；记错时追加红字冲销。</span><button class="btn primary" type="submit" ' + (ST.writing ? 'disabled' : '') + '>加密并记入账本</button></div></form>';
+}
+function emptyState(title, text) { return '<div class="empty"><b>' + esc(title) + '</b><p>' + esc(text) + '</p></div>'; }
+function recentRows(list, actions) {
+  if (!list.length) return emptyState('还没有账目', '第一笔记录会同时出现在本机明细与同步队列中。');
+  return '<div class="transaction-list">' + list.map(p => '<div class="transaction"><div class="transaction-main"><div class="transaction-title">' + esc(p.note || (p.type === 'income' ? '收入' : '支出')) + (p.reversalOf ? '<span class="tag neutral">冲销</span>' : '') + '</div>' +
+    '<div class="transaction-meta">' + esc(p.date) + '<i></i>' + esc(p.book) + '<i></i>#' + p.seq + '</div></div>' +
+    '<div class="transaction-side"><div class="amount ' + (p.type === 'income' ? 'income' : 'expense') + '">' + (p.type === 'income' ? '+' : '−') + fmt(p.amount) + '</div>' +
+    '<span class="tag ' + (p.pending ? 'pending' : 'good') + '">' + (p.pending ? '待同步' : '已同步') + '</span></div>' +
+    (actions ? '<button class="text-btn reverse-link" data-act="reverse-entry" data-hash="' + esc(p.hash) + '">红字冲销</button>' : '') + '</div>').join('') + '</div>';
+}
+function viewOverview() {
+  const t = totals(), recent = ST.plain.slice().reverse().slice(0,6);
+  return '<section class="page-intro"><div><div class="eyebrow">' + new Date().toLocaleDateString('zh-CN', { month:'long', day:'numeric', weekday:'long' }) + '</div><h1>今天，也把账记清楚。</h1><p>网络只决定何时上传，不决定能否记账。</p></div><button class="btn secondary desktop-only" data-act="tab" data-v="records">查看全部明细</button></section>' +
+    '<section class="kpi-grid"><div class="kpi"><span>净额</span><strong>' + fmt(t.net) + '</strong><small>收入减去支出，含本机待同步</small></div>' +
+    '<div class="kpi"><span>累计收入</span><strong class="income">' + fmt(t.income) + '</strong><small>' + ST.plain.filter(x => x.type === 'income').length + ' 笔已解密记录</small></div>' +
+    '<div class="kpi"><span>累计支出</span><strong>' + fmt(t.expense) + '</strong><small>' + ST.plain.filter(x => x.type !== 'income').length + ' 笔已解密记录</small></div>' +
+    '<div class="kpi sync-kpi"><span>待同步</span><strong data-pending-count>' + ST.outbox.length + '</strong><small>本机已封存，联网自动上传</small></div></section>' +
+    syncNotice() +
+    '<div class="overview-grid"><section class="panel"><div class="panel-head"><div><span class="section-kicker">QUICK ENTRY</span><h2>快速记一笔</h2></div><span class="tag neutral">只追加</span></div>' + entryForm() + '</section>' +
+    '<section class="panel"><div class="panel-head"><div><span class="section-kicker">RECENT</span><h2>最近账目</h2></div><button class="text-btn" data-act="tab" data-v="records">全部</button></div>' + recentRows(recent, false) + '</section></div>';
+}
+function viewEntry() {
+  return '<div class="entry-layout"><section class="panel"><div class="panel-head"><div><span class="section-kicker">NEW ENTRY</span><h1>记录一笔资金变化</h1></div></div>' + entryForm() + '</section>' +
+    '<aside class="entry-aside">' + syncNotice() + '<section class="plain-section"><span class="section-kicker">发生了什么</span><h2>先封存，再上传</h2><ol class="steps"><li><b>本机加密</b><span>摘要、金额和往来信息不会以明文写入数据库。</span></li><li><b>签名并接续哈希</b><span>记录获得连续序号、前序哈希和身份签名。</span></li><li><b>联网自动同步</b><span>按顺序上传；已存在的哈希直接确认，不会记重。</span></li></ol></section></aside></div>';
+}
+function filteredRecords() {
+  const q = ST.filter.text.toLowerCase();
+  return ST.plain.filter(p => (ST.filter.book === 'all' || p.book === ST.filter.book) &&
+    (ST.filter.status === 'all' || (ST.filter.status === 'pending') === !!p.pending) &&
+    (!q || [p.note,p.party,p.voucher,p.date,p.book].some(x => String(x || '').toLowerCase().includes(q)))).reverse();
+}
+function viewRecords() {
+  const list = filteredRecords();
+  return '<section class="page-intro compact-intro"><div><h1>全部账目</h1><p>共 ' + ST.plain.length + ' 笔可解密记录，当前显示 ' + list.length + ' 笔。</p></div><button class="btn primary" data-act="tab" data-v="entry">记一笔</button></section>' +
+    '<section class="panel filter-panel"><div class="filters"><div class="field"><label for="record-search">搜索</label><input class="inp" id="record-search" value="' + esc(ST.filter.text) + '" placeholder="摘要、往来、凭证或日期"></div>' +
+    '<div class="field"><label for="record-book">账本</label><select class="inp" id="record-book"><option value="all">全部账本</option>' + ST.books.map(b => '<option value="' + esc(b) + '" ' + (ST.filter.book === b ? 'selected' : '') + '>' + esc(b) + '</option>').join('') + '</select></div>' +
+    '<div class="field"><label for="record-status">同步状态</label><select class="inp" id="record-status"><option value="all">全部状态</option><option value="synced" ' + (ST.filter.status === 'synced' ? 'selected' : '') + '>已同步</option><option value="pending" ' + (ST.filter.status === 'pending' ? 'selected' : '') + '>待同步</option></select></div>' +
+    '<button class="btn secondary filter-submit" data-act="apply-filters">筛选</button></div></section>' +
+    '<section class="panel records-panel"><div class="records-head"><span>账目</span><span>金额与状态</span></div>' + recentRows(list, true) + '</section>';
+}
+
 function consistency(proof, saved) {
   const n = Number(saved.anchorCount || saved.count || 0), head = saved.anchorHead || saved.head;
   if (!n || !head) return { ok:false, msg:'锚点文件格式不正确' };
   const arr = proof.anchors || [];
-  if (!arr[n-1]) return { ok:false, msg:'当前锚链比保存时更短：服务端可能回滚过，或运行环境被重建' };
-  if (arr[n-1].hash !== head) return { ok:false, msg:'锚点哈希不匹配：账本历史被替换过' };
+  if (!arr[n-1]) return { ok:false, msg:'当前锚链比保存时更短，可能回滚或环境重建' };
+  if (arr[n-1].hash !== head) return { ok:false, msg:'锚点哈希不匹配，历史可能被替换' };
   return { ok:true, extended:arr.length - n };
 }
 function viewVerify() {
@@ -246,109 +476,47 @@ function viewVerify() {
   const proof = ST.proof || { anchors:[], anchorHead:'—', anchorCount:0 };
   const savedRows = savedAnchors().slice().reverse().map(s => {
     const c = consistency(proof, s);
-    return '<div class="list-row"><div class="lr-main"><div class="lr-t mono">#' + (s.anchorCount || s.count) +
-      ' · ' + esc(String(s.anchorHead || s.head).slice(0,16)) + '…</div>' +
-      '<div class="lr-s">' + esc(s.savedAt || '') + ' · ' + esc(c.ok ? '一致，此后新增 ' + c.extended + ' 个锚点' : c.msg) + '</div></div>' +
-      '<span class="tag ' + (c.ok ? 'good' : 'bad') + '">' + (c.ok ? '一致' : '异常') + '</span></div>';
-  }).join('') || '<div class="empty">还没有保存过锚点</div>';
-  const own = (a.owners || []).map(o => '<div class="list-row"><div class="lr-main">' +
-    '<div class="lr-t mono">' + esc(o.fp) + (o.fp === ST.id.fp ? ' <span class="tag info">我</span>' : '') + '</div>' +
-    '<div class="lr-s">' + o.count + ' 条 · 链头 ' + esc(o.head.slice(0,20)) + '…</div></div>' +
-    '<button class="btn sm" data-act="verify-one" data-fp="' + esc(o.fp) + '">校验</button></div>').join('') || '<div class="empty">链上还没有身份</div>';
-  return '<div class="card"><div class="card-h"><div class="card-t">全局哈希承诺</div>' +
-    '<button class="btn sm" data-act="refresh-anchors">刷新</button></div>' +
-    '<div class="field"><label>Merkle 根（任何改动都会让它变化）</label><div class="mono" style="color:var(--accent);word-break:break-all">' + esc(a.merkleRoot) + '</div></div>' +
-    '<div class="note">公开接口只返回序号、前序哈希、本条哈希、时间戳与签名。<b>不返回密文，也不返回账目内容</b>。' +
-    '任何人都能验证链是否连续、签名是否属于该身份、链头是否与公布的一致。</div>' +
-    '<div class="card-s">已登记身份 ' + (a.owners || []).length + ' 个 · 策略：只追加 / 密文永不公开 / 仅哈希承诺</div>' + own + '</div>' +
-    '<div class="card" id="verify-detail"><div class="card-h"><div class="card-t">独立校验结果</div></div>' +
-    '<div class="card-s">点上面的「校验」，浏览器会本地重算整条哈希链并用该身份的公钥验签，不依赖服务端结论。</div></div>' +
-    '<div class="card"><div class="card-h"><div class="card-t">锚定证明与回滚检测</div>' +
-      '<span class="tag ' + (proof.anchorCount ? 'good' : 'info') + '">' + (proof.anchorCount || 0) + ' 个锚点</span></div>' +
-      '<div class="field"><label>当前锚链头</label><div class="mono" style="color:var(--accent);word-break:break-all">' + esc(proof.anchorHead || '—') + '</div></div>' +
-      '<div class="note">服务端每写入一个事件就把当时的 Merkle 根串进只追加的锚链。把锚点或完整证明保存下来，日后核对：' +
-      '如果存储被整体替换或回滚，旧锚点就不会出现在新锚链的前缀里，一致性校验会立刻失败。这不依赖任何第三方，也不需要信任服务端。</div>' +
-      '<div class="row">' +
-        '<button class="btn sm" data-act="save-anchor">保存当前锚点</button>' +
-        '<button class="btn sm" data-act="export-proof">下载锚定证明</button>' +
-        '<button class="btn sm" data-act="import-anchor">导入历史锚点校验</button>' +
-        '<button class="btn sm" data-act="open-public">公开验证页</button>' +
-        '<button class="btn sm" data-act="copy-public">复制公开链接</button>' +
-      '</div><div style="margin-top:12px">' + savedRows + '</div></div>';
+    return '<div class="audit-row"><div><b>#' + (s.anchorCount || s.count) + ' · ' + shortHash(s.anchorHead || s.head, 20) + '…</b><span>' + esc(s.savedAt || '') + ' · ' + esc(c.ok ? '一致，此后新增 ' + c.extended + ' 个锚点' : c.msg) + '</span></div><span class="tag ' + (c.ok ? 'good' : 'bad') + '">' + (c.ok ? '一致' : '异常') + '</span></div>';
+  }).join('') || emptyState('尚未保存锚点', '联网后保存当前锚点，可用于日后发现历史回滚。');
+  const own = (a.owners || []).map(o => '<div class="audit-row"><div><b class="mono">' + esc(o.fp) + (o.fp === ST.id.fp ? ' <span class="tag info">当前身份</span>' : '') + '</b><span>' + o.count + ' 条 · 链头 ' + shortHash(o.head, 20) + '…</span></div><button class="btn small secondary" data-act="verify-one" data-fp="' + esc(o.fp) + '">独立校验</button></div>').join('') || emptyState('暂无公开身份', '联网后这里会显示仅含哈希的公开状态。');
+  return '<div class="verify-grid"><section class="panel span-full"><div class="panel-head"><div><span class="section-kicker">PUBLIC COMMITMENT</span><h1>全局哈希承诺</h1></div><button class="btn secondary" data-act="refresh-anchors">刷新公开状态</button></div>' +
+    '<div class="hash-block"><span>MERKLE ROOT</span><code>' + esc(a.merkleRoot) + '</code></div><p class="muted">公开接口只返回序号、前序哈希、本条哈希、时间戳与签名，不返回密文或账目内容。</p></section>' +
+    '<section class="panel"><div class="panel-head"><h2>身份链</h2><span class="tag neutral">' + (a.owners || []).length + ' 个</span></div>' + own + '</section>' +
+    '<section class="panel" id="verify-detail"><div class="panel-head"><h2>独立校验结果</h2></div><p class="muted">选择一条身份链，浏览器会在本地重算连续性并验签，而不是直接相信服务端结论。</p></section>' +
+    '<section class="panel span-full"><div class="panel-head"><div><span class="section-kicker">ROLLBACK DETECTION</span><h2>锚定证明与回滚检测</h2></div><span class="tag ' + (proof.anchorCount ? 'good' : 'neutral') + '">' + (proof.anchorCount || 0) + ' 个锚点</span></div>' +
+    '<div class="hash-block"><span>ANCHOR HEAD</span><code>' + esc(proof.anchorHead || '—') + '</code></div>' +
+    '<div class="button-row"><button class="btn secondary" data-act="save-anchor">保存当前锚点</button><button class="btn secondary" data-act="export-proof">下载锚定证明</button><button class="btn secondary" data-act="import-anchor">导入历史锚点</button><button class="btn ghost" data-act="open-public">公开验证页</button><button class="btn ghost" data-act="copy-public">复制公开链接</button></div><div class="audit-list">' + savedRows + '</div></section></div>';
 }
 function viewGrants() {
   const g = ST.grants || { out:[], in:[] };
-  const outRows = g.out.length ? g.out.map(x => '<div class="list-row"><div class="lr-main">' +
-    '<div class="lr-t">' + esc(x.label || x.bookTag.slice(0,10)) + ' → <span class="mono">' + esc(x.to) + '</span></div>' +
-    '<div class="lr-s">授权时间 ' + new Date(x.ts).toLocaleString('zh-CN') + '</div></div>' +
-    '<button class="btn sm danger" data-act="revoke" data-id="' + esc(x.id) + '">撤销</button></div>').join('') : '<div class="empty">还没有授权给别人</div>';
-  const inRows = (ST.shared && ST.shared.length) ? ST.shared.map(x => '<div class="list-row"><div class="lr-main">' +
-    '<div class="lr-t">' + esc(x.label || '共享账本') + ' · 来自 <span class="mono">' + esc(x.from) + '</span></div>' +
-    '<div class="lr-s">' + x.entries.length + ' 条密文 · 已用你的私钥解开查看密钥</div></div>' +
-    '<button class="btn sm" data-act="view-shared" data-id="' + esc(x.grantId) + '">查看</button></div>').join('') : '<div class="empty">还没有人授权给你</div>';
-  return '<div class="grid2"><div class="card"><div class="card-h"><div class="card-t">授权别人看懂指定账本</div></div>' +
-    '<div class="card-s">把某个账本的数据密钥，用对方的公钥加密后交给对方。服务端只负责转交与按标签过滤，全程看不到明文。</div>' +
-    '<div class="field" style="margin-top:12px"><label>对方身份指纹（20 位）</label><input class="inp" id="g-to" placeholder="对方在「身份与备份」里能看到"></div>' +
-    '<div class="field"><label>授权哪个账本</label><select class="inp" id="g-book">' + ST.books.map(b => '<option>' + esc(b) + '</option>').join('') + '</select></div>' +
-    '<button class="btn primary" data-act="grant">生成并发送授权</button>' +
-    '<div class="note warn">撤销只阻止之后继续读取；对方在授权期间已经看过或保存的内容，密码学上无法收回。</div></div>' +
-    '<div class="card"><div class="card-h"><div class="card-t">我发出的授权</div></div>' + outRows + '</div></div>' +
-    '<div class="card"><div class="card-h"><div class="card-t">别人授权给我</div></div>' + inRows + '</div>';
+  const outRows = g.out.length ? g.out.map(x => '<div class="audit-row"><div><b>' + esc(x.label || x.bookTag.slice(0,10)) + ' → <span class="mono">' + esc(x.to) + '</span></b><span>' + new Date(x.ts).toLocaleString('zh-CN') + '</span></div><button class="btn small danger" data-act="revoke" data-id="' + esc(x.id) + '">撤销</button></div>').join('') : emptyState('没有发出的授权', '你的账本默认只有你能解开。');
+  const inRows = (ST.shared && ST.shared.length) ? ST.shared.map(x => '<div class="audit-row"><div><b>' + esc(x.label || '共享账本') + '</b><span>来自 <span class="mono">' + esc(x.from) + '</span> · ' + x.entries.length + ' 条</span></div><button class="btn small secondary" data-act="view-shared" data-id="' + esc(x.grantId) + '">解密查看</button></div>').join('') : emptyState('没有收到的授权', '对方需要你的身份指纹才能授权。');
+  return '<div class="grant-grid"><section class="panel"><div class="panel-head"><div><span class="section-kicker">SELECTIVE DISCLOSURE</span><h1>授权指定账本</h1></div></div><p class="muted">账本数据密钥会用对方公钥封装。服务端只转交封装结果，无法因此看到明文。</p>' +
+    '<div class="field"><label for="g-to">对方身份指纹</label><input class="inp mono" id="g-to" placeholder="20 位身份指纹"></div><div class="field"><label for="g-book">授权账本</label><select class="inp" id="g-book">' + ST.books.map(b => '<option>' + esc(b) + '</option>').join('') + '</select></div>' +
+    '<button class="btn primary" data-act="grant">生成并发送授权</button><div class="fine-print">撤销只阻止之后读取；对方已经看到或保存的内容无法密码学收回。此操作需要联网。</div></section>' +
+    '<div><section class="panel"><div class="panel-head"><h2>我发出的授权</h2></div>' + outRows + '</section><section class="panel"><div class="panel-head"><h2>别人授权给我</h2></div>' + inRows + '</section></div></div>';
 }
 function viewIdentity() {
-  return '<div class="grid2"><div class="card"><div class="card-h"><div class="card-t">我的身份</div><span class="tag good">密钥即身份</span></div>' +
-    '<div class="field"><label>身份指纹（可以给别人，用于授权给你）</label><div class="mono" style="color:var(--accent)">' + esc(ST.id.fp) + '</div></div>' +
-    '<div class="row"><button class="btn sm" data-act="copy-fp">复制指纹</button><button class="btn sm" data-act="show-words">查看助记词</button></div>' +
-    '<div class="note">服务端只保存：公钥、用你助记词加密的私钥包、密文记录、哈希链。没有邮箱、手机号、密码，也没有任何能解开内容的凭据。</div></div>' +
-    '<div class="card"><div class="card-h"><div class="card-t">备份与迁移</div></div>' +
-    '<div class="card-s">服务端存储可能随运行环境重建而清空。助记词 + 导出的加密账本可在任何新环境恢复：导入后能本地解密查看；若服务端为空，还可逐条重新提交，完整重建链上记录（每条仍要过哈希与签名校验）。记录已做 512 字节定长填充，密文大小不再泄露内容长度。</div>' +
-    '<div class="row" style="margin-top:12px"><button class="btn" data-act="export-ledger">导出加密账本</button>' +
-    '<button class="btn" data-act="import-ledger">导入账本文件</button></div>' +
-    '<div class="note warn">助记词是唯一恢复方式。建议离线抄写，不要截图、不要存网盘明文。</div></div></div>' +
-    '<div class="card"><div class="card-h"><div class="card-t">技术边界（如实说明）</div></div>' +
-    '<div class="card-s">① 服务端账号层面没有改删接口，但运行环境提供者理论上可以替换整个存储；把 Merkle 根定期抄走或锚定到外部，就能发现这种情况。' +
-    '② 密文长期保存存在未来算法风险，公开层只有哈希，不承担这个风险。③ 记账时间、笔数、记录大小等元数据仍可被服务端观察。' +
-    '④ 真正的审计级不可篡改需要多机构交叉签名或公链锚定，这是下一步。</div></div>';
+  return '<div class="identity-grid"><section class="panel"><div class="panel-head"><div><span class="section-kicker">IDENTITY</span><h1>我的身份</h1></div><span class="tag good">密钥即身份</span></div>' +
+    '<div class="field"><label>身份指纹（可安全分享）</label><div class="hash-block"><code>' + esc(ST.id.fp) + '</code></div></div><div class="button-row"><button class="btn secondary" data-act="copy-fp">复制指纹</button><button class="btn ghost" data-act="show-words">查看助记词</button></div>' +
+    '<p class="muted">服务端只保存公钥、助记词加密的私钥包、密文记录与哈希链，没有邮箱、手机号或密码。</p></section>' +
+    '<section class="panel"><div class="panel-head"><div><span class="section-kicker">BACKUP</span><h2>加密备份与迁移</h2></div></div><p class="muted">导出文件包含本机全部已同步与待同步密文。导入另一台设备后，会并入待同步队列，由幂等规则去掉服务端已有记录。</p>' +
+    '<div class="storage-stats"><div><span>本机密文记录</span><b>' + ST.entries.length + '</b></div><div><span>待同步</span><b>' + ST.outbox.length + '</b></div><div><span>本机链高</span><b>' + ST.me.seq + '</b></div></div>' +
+    '<div class="button-row"><button class="btn primary" data-act="export-ledger">导出加密账本</button><button class="btn secondary" data-act="import-ledger">导入账本文件</button></div><div class="fine-print warn-text">清除浏览器数据会删除尚未上传的本机记录。重要账目请同时保留加密导出文件；助记词请离线抄写。</div></section>' +
+    '<section class="panel span-full"><div class="panel-head"><h2>同步与技术边界</h2></div><div class="boundary-grid"><div><b>离线持久化</b><p>本机数据库只存密文与签名；重新打开页面后，需要助记词才能解密查看。</p></div><div><b>多设备分叉</b><p>同一身份在多台设备同时离线追加可能形成不同历史。系统会暂停，不会自动覆盖。</p></div><div><b>外部锚定</b><p>GitHub 锚点用于发现服务端回滚；公开文件只有哈希，不含密文或助记词。</p></div><div><b>部署持久卷</b><p>正式服务端必须为事件日志配置持久存储，浏览器备份不是服务端容灾的替代品。</p></div></div></section></div>';
 }
 
-/* ---------------- 数据 ---------------- */
-async function refresh() {
-  ST.me = await api('/api/me', 'GET');
-  const r = await api('/api/entries', 'GET');
-  ST.entries = r.entries;
-  const tagMap = {};
-  for (const b of ST.books) tagMap[await bookTag(ST.id, b)] = b;
-  const plain = [];
-  for (const e of r.entries) {
-    const b = tagMap[e.bookTag]; if (!b) continue;
-    try {
-      const p = await aesDec(await bookKey(ST.id, b), e.cipher);
-      plain.push(Object.assign({}, p, { seq:e.seq, hash:e.hash }));
-    } catch (err) {}
-  }
-  ST.plain = plain;
-  ST.anchors = await api('/api/anchors', 'GET', null, false);
-  ST.proof = await api('/api/anchor-proof', 'GET', null, false);
-  ST.grants = await api('/api/grants', 'GET');
-  ST.shared = (await api('/api/shared', 'GET')).shared;
+function render(clearDraft) {
+  const ids = ['f-amount','f-type','f-date','f-note','f-book','f-party','f-voucher'];
+  const draft = {};
+  if (!clearDraft) for (const id of ids) { const el = document.getElementById(id); if (el) draft[id] = el.value; }
+  if (ST.id) viewMain(); else viewWelcome();
+  if (!clearDraft) for (const id of Object.keys(draft)) { const el = document.getElementById(id); if (el) el.value = draft[id]; }
 }
-async function addEntry() {
-  const amount = Math.round(Number(String($('#f-amount').value).replace(/[^\d.]/g,'')) * 100);
-  if (!amount || amount <= 0) { toast('请输入有效金额', 'err'); return; }
-  const book = $('#f-book').value;
-  const plain = { type:$('#f-type').value, amount, book, date:$('#f-date').value || today(),
-    note:$('#f-note').value.trim(), party:$('#f-party').value.trim(), voucher:$('#f-voucher').value.trim() };
-  const cipher = await aesEnc(await bookKey(ST.id, book), plain);
-  const tag = await bookTag(ST.id, book);
-  const seq = ST.me.seq + 1, prevHash = ST.me.head, ts = Date.now();
-  const hash = await sha256hex([seq, prevHash, ST.id.fp, cipher, tag, ts].join('|'));
-  const sig = b64(await subtle().sign({ name:'ECDSA', hash:'SHA-256' }, await importSignPriv(ST.id), enc(hash)));
-  await api('/api/entries', 'POST', { seq, prevHash, hash, cipher, sig, bookTag:tag, ts });
-  await refresh(); render(); toast('已签名并写入不可变账本');
-}
+
 async function verifyOne(fp) {
   const a = await api('/api/anchors/' + fp, 'GET', null, false);
-  let prev = '0'.repeat(64), broken = -1, sigOk = true;
+  let prev = GENESIS, broken = -1, sigOk = true;
   const pub = await importSignPub(a.pubSign);
   for (let i = 0; i < a.chain.length; i++) {
     const e = a.chain[i];
@@ -357,80 +525,83 @@ async function verifyOne(fp) {
     catch (err) { sigOk = false; }
     prev = e.hash;
   }
-  const headOk = prev === a.head;
-  const ok = broken < 0 && headOk && sigOk;
-  const rows = a.chain.slice(0, 12).map(e => '<div><span>#' + e.seq + '</span><span>' + esc(e.hash) + '</span></div>').join('');
+  const headOk = prev === a.head, ok = broken < 0 && headOk && sigOk;
+  const rows = a.chain.slice(0, 12).map(e => '<div class="chain-row"><span>#' + e.seq + '</span><code>' + esc(e.hash) + '</code></div>').join('');
   const el = $('#verify-detail'); if (!el) return;
-  el.innerHTML = '<div class="card-h"><div class="card-t">独立校验：' + esc(fp) + '</div>' +
-    '<span class="tag ' + (ok ? 'good' : 'bad') + '">' + (ok ? '校验通过' : '发现异常') + '</span></div>' +
-    '<div class="card-s">链长 ' + a.chain.length + ' 条 · 序号连续：' + (broken < 0 ? '是' : '否（第 ' + broken + ' 条断开）') +
-    ' · 签名有效：' + (sigOk ? '是' : '否') + ' · 链头一致：' + (headOk ? '是' : '否') + '</div>' +
-    '<div class="chain">' + (rows || '<div>暂无记录</div>') + '</div>';
+  el.innerHTML = '<div class="panel-head"><h2>独立校验</h2><span class="tag ' + (ok ? 'good' : 'bad') + '">' + (ok ? '校验通过' : '发现异常') + '</span></div>' +
+    '<p class="muted">链长 ' + a.chain.length + ' · 序号连续：' + (broken < 0 ? '是' : '否') + ' · 签名有效：' + (sigOk ? '是' : '否') + ' · 链头一致：' + (headOk ? '是' : '否') + '</p>' +
+    '<div class="chain-list">' + (rows || emptyState('空账本','还没有可校验的记录')) + '</div>';
 }
 async function grant() {
+  if (!navigator.onLine) throw new Error('授权需要联网；离线记账不受影响');
   const to = $('#g-to').value.trim(), book = $('#g-book').value;
-  if (!to) { toast('请填对方身份指纹', 'err'); return; }
+  if (!to) throw new Error('请填对方身份指纹');
   const other = await api('/api/pub/' + to, 'GET', null, false);
-  const bits = await subtle().deriveBits({ name:'ECDH', public: await importDhPub(other.pubDh) }, await importDhPriv(ST.id), 256);
+  const bits = await subtle().deriveBits({ name:'ECDH', public:await importDhPub(other.pubDh) }, await importDhPriv(ST.id), 256);
   const wrap = await aesKey(new Uint8Array(bits), ['encrypt','decrypt']);
   const raw = await subtle().exportKey('raw', await bookKey(ST.id, book));
   const wrappedKey = await aesEncRaw(wrap, new Uint8Array(raw));
-  await api('/api/grants', 'POST', { id:uid(), to, bookTag:await bookTag(ST.id, book), wrappedKey, label:book });
-  await refresh(); render(); toast('授权已生成，对方现在可以解开这个账本');
+  await authed('/api/grants', 'POST', { id:uid(), to, bookTag:await bookTag(ST.id, book), wrappedKey, label:book });
+  await refreshAncillary(); render(); toast('授权已生成，对方现在可以解开这个账本');
 }
 async function viewShared(grantId) {
   const g = (ST.shared || []).find(x => x.grantId === grantId); if (!g) return;
   const other = await api('/api/pub/' + g.from, 'GET', null, false);
-  const bits = await subtle().deriveBits({ name:'ECDH', public: await importDhPub(other.pubDh) }, await importDhPriv(ST.id), 256);
+  const bits = await subtle().deriveBits({ name:'ECDH', public:await importDhPub(other.pubDh) }, await importDhPriv(ST.id), 256);
   const wrap = await aesKey(new Uint8Array(bits), ['encrypt','decrypt']);
-  const raw = await aesDecRaw(wrap, g.wrappedKey);
-  const bk = await aesKey(raw, ['decrypt']);
+  const raw = await aesDecRaw(wrap, g.wrappedKey), bk = await aesKey(raw, ['decrypt']);
   const rows = [];
   for (const e of g.entries) {
-    try { const p = await aesDec(bk, e.cipher); rows.push('<div class="list-row"><div class="lr-main"><div class="lr-t">' + esc(p.note || '—') + '</div>' +
-      '<div class="lr-s">' + esc(p.date) + ' · #' + e.seq + '</div></div><div class="lr-v">' + (p.type === 'income' ? '+' : '-') + fmt(p.amount) + '</div></div>'); }
+    try { const p = await aesDec(bk, e.cipher); rows.push({ plain:Object.assign({}, p, { seq:e.seq, hash:e.hash, pending:false }) }); }
     catch (err) {}
   }
-  modal('<h3>' + esc(g.label || '共享账本') + '</h3><div class="card-s">来自 ' + esc(g.from) + ' · 共 ' + rows.length + ' 条，已用你的私钥解开</div>' +
-    (rows.join('') || '<div class="empty">这个账本还没有记录</div>') +
-    '<div class="row" style="margin-top:14px"><button class="btn" data-act="close-modal">关闭</button></div>');
+  modal('<div class="eyebrow">共享账本</div><h2>' + esc(g.label || '共享账本') + '</h2><p class="muted">来自 ' + esc(g.from) + ' · 已用当前私钥解开</p>' +
+    (rows.length ? recentRows(rows.map(x => x.plain).reverse(), false) : emptyState('暂无可解密记录','这个账本还没有记录')) +
+    '<div class="button-row"><button class="btn secondary" data-act="close-modal">关闭</button></div>');
 }
 
-function render() { ST.id ? viewMain() : viewWelcome(); }
+/* ---------------- 交互 ---------------- */
+document.addEventListener('submit', async e => {
+  if (e.target.id !== 'entry-form') return;
+  e.preventDefault();
+  try { await addEntry(); } catch (err) { toast(err.message || '记账失败', 'err'); }
+});
 
-/* ---------------- 事件 ---------------- */
 document.addEventListener('click', async e => {
   const el = e.target.closest('[data-act]'); if (!el) return;
   const a = el.dataset.act;
   try {
     switch (a) {
+      case 'mode': ST.mode = el.dataset.v; ST.tmp = null; render(); break;
       case 'gen-words': ST.tmp = newMnemonic(); render(); break;
       case 'cancel-words': ST.tmp = null; render(); break;
       case 'copy-words': await copy(ST.tmp); break;
       case 'confirm-words': {
-        const m = ST.tmp;
-        const id = await createIdentity(m);
-        const r = await login(id);
-        TOKEN = r.token; ST.id = id; ST.tmp = null; cacheIdentity(id);
-        await refresh(); render(); toast('身份已创建，助记词请务必保管好'); break;
+        if (!$('#words-ack') || !$('#words-ack').checked) { toast('请先确认已离线抄写助记词', 'warn'); break; }
+        const id = await createIdentity(ST.tmp);
+        await startIdentity(id);
+        toast('身份已创建。现在即使断网，也可以开始记账'); break;
       }
       case 'restore': {
         const m = normMnemonic($('#restore-words').value);
-        if (m.split(' ').length !== 16) { toast('需要 16 个词', 'err'); return; }
-        if (m.split(' ').some(w => WORDS.indexOf(w) < 0)) { toast('有词不在词表里，请检查拼写', 'err'); return; }
-        const id = await restoreIdentity(m);
-        const r = await login(id);
-        TOKEN = r.token; ST.id = id; cacheIdentity(id);
-        await refresh(); render(); toast('身份已恢复'); break;
+        if (m.split(' ').length !== 16) throw new Error('需要 16 个助记词');
+        if (m.split(' ').some(w => WORDS.indexOf(w) < 0)) throw new Error('有词不在词表里，请检查拼写');
+        const id = await restoreIdentity(m); await startIdentity(id); toast('身份已恢复，本机密文账本已解密'); break;
       }
-      case 'logout': TOKEN = ''; ST.id = null; ST.plain = []; render(); break;
+      case 'logout':
+        TOKEN = ''; ST.id = null; ST.plain = []; ST.entries = []; ST.outbox = []; ST.me = { seq:0, head:GENESIS };
+        ST.grants = null; ST.shared = null; ST.tmp = null; ST.mode = 'restore'; render(); break;
       case 'theme': {
         const t = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
         document.documentElement.dataset.theme = t;
-        try { localStorage.setItem('jianji.theme', t); } catch (e) {}
+        try { localStorage.setItem('jianji.theme', t); } catch (err) {}
         break;
       }
       case 'tab': ST.tab = el.dataset.v; render(); break;
+      case 'sync-now':
+        if (!navigator.onLine) toast('当前无网络；记录会继续保存在本机', 'warn');
+        else { toast('正在检查连接与待同步队列'); await synchronize(); }
+        break;
       case 'public-check': case 'refresh-anchors':
         ST.anchors = await api('/api/anchors', 'GET', null, false);
         ST.proof = await api('/api/anchor-proof', 'GET', null, false);
@@ -439,122 +610,128 @@ document.addEventListener('click', async e => {
       case 'save-anchor': {
         const p = (ST.proof = await api('/api/anchor-proof', 'GET', null, false));
         const arr = savedAnchors();
-        arr.push({ anchorCount:p.anchorCount, anchorHead:p.anchorHead, root:p.merkleRoot,
-          savedAt:new Date().toLocaleString('zh-CN') });
-        writeSavedAnchors(arr); render();
-        toast('锚点已保存到本机，可随时回来核对历史有没有被替换'); break;
+        arr.push({ anchorCount:p.anchorCount, anchorHead:p.anchorHead, root:p.merkleRoot, savedAt:new Date().toLocaleString('zh-CN') });
+        writeSavedAnchors(arr); render(); toast('锚点已保存到本机，可用于日后核对历史'); break;
       }
       case 'export-proof': {
         const p = (ST.proof = await api('/api/anchor-proof', 'GET', null, false));
-        const blob = new Blob([JSON.stringify(p, null, 2)], { type:'application/json' });
-        const a2 = document.createElement('a'); a2.href = URL.createObjectURL(blob);
-        a2.download = '简记_锚定证明_' + today() + '.json'; a2.click();
-        setTimeout(() => URL.revokeObjectURL(a2.href), 500);
-        toast('锚定证明已导出，建议存到不会被删改的地方'); break;
+        downloadJSON(p, '简记_锚定证明_' + today() + '.json'); toast('锚定证明已导出'); break;
       }
       case 'import-anchor': {
         const p = (ST.proof = await api('/api/anchor-proof', 'GET', null, false));
-        const i = document.createElement('input'); i.type = 'file'; i.accept = '.json';
-        i.onchange = async () => {
-          const f = i.files && i.files[0]; if (!f) return;
+        const input = document.createElement('input'); input.type = 'file'; input.accept = '.json';
+        input.onchange = async () => {
+          const f = input.files && input.files[0]; if (!f) return;
           try {
             const j = JSON.parse(await f.text());
             const saved = j.anchorHead ? j : (Array.isArray(j) ? j[j.length-1] : null);
             if (!saved) throw new Error('不是有效的锚点或锚定证明文件');
             const c = consistency(p, saved);
-            modal('<h3>锚点一致性校验</h3>' +
-              '<div class="note ' + (c.ok ? 'good' : 'warn') + '">' + (c.ok
-                ? '一致：保存时的第 ' + (saved.anchorCount || saved.count) + ' 个锚点仍在当前锚链前缀中，此后新增 ' + c.extended + ' 个锚点。账本历史没有被回滚或替换。'
-                : esc(c.msg)) + '</div>' +
-              '<div class="card-s">导入锚链头：<span class="mono">' + esc(String(saved.anchorHead || saved.head).slice(0,32)) + '…</span><br>' +
-              '当前锚链头：<span class="mono">' + esc(String(p.anchorHead).slice(0,32)) + '…</span></div>' +
-              '<div class="row" style="margin-top:14px"><button class="btn" data-act="close-modal">关闭</button></div>');
+            modal('<div class="eyebrow">历史一致性</div><h2>锚点校验结果</h2><div class="notice ' + (c.ok ? 'success' : 'danger') + '"><b>' + (c.ok ? '历史前缀一致' : '发现异常') + '</b><p>' + (c.ok
+              ? '保存时的第 ' + (saved.anchorCount || saved.count) + ' 个锚点仍在当前锚链前缀中，此后新增 ' + c.extended + ' 个锚点。' : esc(c.msg)) + '</p></div>' +
+              '<div class="hash-block"><span>导入锚链头</span><code>' + esc(String(saved.anchorHead || saved.head)) + '</code></div>' +
+              '<div class="button-row"><button class="btn secondary" data-act="close-modal">关闭</button></div>');
           } catch (err) { toast(err.message, 'err'); }
         };
-        i.click(); break;
+        input.click(); break;
       }
       case 'open-public': window.open('/verify.html?fp=' + ST.id.fp, '_blank'); break;
       case 'copy-public': await copy(location.origin + '/verify.html?fp=' + ST.id.fp); break;
       case 'add-book': {
         const name = prompt('新账本名称（例如：项目 A 备用金）');
-        if (name && name.trim() && ST.books.indexOf(name.trim()) < 0) { ST.books.push(name.trim()); ST.book = name.trim(); render(); }
+        if (name && name.trim() && !ST.books.includes(name.trim())) {
+          ST.books.push(name.trim()); ST.book = name.trim();
+          await LedgerStore.setMeta('books:' + ST.id.fp, ST.books); render();
+        }
         break;
       }
-      case 'add-entry': await addEntry(); break;
+      case 'apply-filters':
+        ST.filter.text = $('#record-search').value.trim(); ST.filter.book = $('#record-book').value; ST.filter.status = $('#record-status').value; render(); break;
+      case 'reverse-entry': {
+        const original = ST.plain.find(p => p.hash === el.dataset.hash); if (!original) break;
+        if (ST.plain.some(p => p.reversalOf === original.hash)) { toast('这笔记录已经冲销过，不能重复冲销', 'warn'); break; }
+        modal('<div class="eyebrow">APPEND-ONLY CORRECTION</div><h2>确认红字冲销</h2><p class="muted">不会修改原记录，而是追加一笔等额、反向的新记录。两笔都会永久保留。</p>' +
+          '<div class="reversal-summary"><span>' + esc(original.date) + ' · ' + esc(original.book) + '</span><b>' + esc(original.note || '未填写摘要') + '</b><strong>' + (original.type === 'income' ? '+' : '−') + fmt(original.amount) + '</strong></div>' +
+          '<div class="button-row"><button class="btn danger" data-act="confirm-reversal" data-hash="' + esc(original.hash) + '">追加冲销记录</button><button class="btn secondary" data-act="close-modal">取消</button></div>'); break;
+      }
+      case 'confirm-reversal': {
+        const original = ST.plain.find(p => p.hash === el.dataset.hash); if (!original) break;
+        $('.modal-bg')?.remove();
+        await addEntry({ type:original.type === 'income' ? 'expense' : 'income', amount:original.amount, book:original.book,
+          date:today(), note:'冲销：' + (original.note || '未填写摘要'), party:original.party || '', voucher:original.voucher || '', reversalOf:original.hash });
+        break;
+      }
       case 'verify-one': await verifyOne(el.dataset.fp); break;
       case 'grant': await grant(); break;
-      case 'revoke': await api('/api/revoke', 'POST', { grantId: el.dataset.id }); await refresh(); render(); toast('授权已撤销'); break;
+      case 'revoke': await authed('/api/revoke', 'POST', { grantId:el.dataset.id }); await refreshAncillary(); render(); toast('授权已撤销'); break;
       case 'view-shared': await viewShared(el.dataset.id); break;
       case 'copy-fp': await copy(ST.id.fp); break;
-      case 'show-words': {
-        const d = modal('<h3>你的助记词</h3><div class="note warn">任何看到这 16 个词的人都能完全控制你的身份和账本。请确认周围没人。</div>' +
-          '<div class="words">' + ST.id.keys.mnemonic.split(' ').map((w,i) => '<div class="word"><b>' + (i+1) + '</b>' + esc(w) + '</div>').join('') + '</div>' +
-          '<div class="row"><button class="btn" data-act="copy-words-now">复制</button><button class="btn" data-act="close-modal">关闭</button></div>');
-        d.addEventListener('click', ev => { if (ev.target.dataset.act === 'copy-words-now') copy(ST.id.keys.mnemonic); });
-        break;
-      }
+      case 'show-words':
+        modal('<div class="eyebrow">敏感信息</div><h2>你的助记词</h2><div class="notice danger"><b>确认周围没有人</b><p>任何看到这 16 个词的人都能控制你的身份并解开账本。</p></div>' +
+          '<div class="words">' + ST.id.keys.mnemonic.split(' ').map((w,i) => '<div class="word"><b>' + String(i+1).padStart(2,'0') + '</b><span>' + esc(w) + '</span></div>').join('') + '</div>' +
+          '<div class="button-row"><button class="btn secondary" data-act="copy-words-now">复制</button><button class="btn ghost" data-act="close-modal">关闭</button></div>'); break;
+      case 'copy-words-now': await copy(ST.id.keys.mnemonic); break;
       case 'export-ledger': {
-        const r = await api('/api/entries', 'GET');
-        const blob = new Blob([JSON.stringify({ app:'简记联网账本', fp:ST.id.fp, exportedAt:new Date().toISOString(),
-          pubSign:ST.id.pubSign, identity:cachedIdentity(), books:ST.books,
-          entries:r.entries, anchors:ST.anchors, proof:ST.proof }, null, 2)], { type:'application/json' });
-        const a2 = document.createElement('a'); a2.href = URL.createObjectURL(blob);
-        a2.download = '简记_加密账本_' + today() + '.json'; a2.click();
-        setTimeout(() => URL.revokeObjectURL(a2.href), 500);
-        toast('加密账本已导出（内容仍是密文）'); break;
+        await refreshLocal();
+        const entries = ST.entries.map(r => r.entry).sort((a,b) => a.seq - b.seq);
+        downloadJSON({ app:'简记统一离线账本', version:3, fp:ST.id.fp, exportedAt:new Date().toISOString(),
+          pubSign:ST.id.pubSign, identity:cachedIdentity(), books:ST.books, entries, anchors:ST.anchors, proof:ST.proof },
+          '简记_加密账本_' + today() + '.json');
+        toast('已导出 ' + entries.length + ' 条密文，包含待同步记录'); break;
       }
       case 'import-ledger': {
-        const i = document.createElement('input'); i.type = 'file'; i.accept = '.json';
-        i.onchange = async () => {
-          const f = i.files && i.files[0]; if (!f) return;
+        const input = document.createElement('input'); input.type = 'file'; input.accept = '.json';
+        input.onchange = async () => {
+          const f = input.files && input.files[0]; if (!f) return;
           try {
             const pack = JSON.parse(await f.text());
             if (!pack.fp || !Array.isArray(pack.entries)) throw new Error('不是有效的简记加密账本');
-            if (pack.fp !== ST.id.fp) throw new Error('这份账本属于身份 ' + pack.fp + '，请用对应助记词登录后再恢复');
+            if (pack.fp !== ST.id.fp) throw new Error('这份账本属于身份 ' + pack.fp + '，请用对应助记词登录');
+            const problem = SyncCore.chainProblem(pack.entries);
+            if (problem) throw new Error('备份文件哈希链序号或前序不连续，已拒绝导入');
+            const local = await LedgerStore.all(ST.id.fp);
+            const localBySeq = new Map(local.map(r => [Number(r.entry.seq), r.entry.hash]));
+            const known = new Set(local.map(r => r.entry.hash));
+            for (const entry of pack.entries) {
+              if (localBySeq.has(Number(entry.seq)) && localBySeq.get(Number(entry.seq)) !== entry.hash)
+                throw new Error('备份与本机在第 ' + entry.seq + ' 条发生分叉，未导入任何记录');
+            }
+            const fresh = pack.entries.filter(entry => !known.has(entry.hash));
+            if (fresh.length) await LedgerStore.putMany(ST.id.fp, fresh, true);
             if (pack.identity && pack.identity.verifier === ST.id.keys.verifier) {
-              try { localStorage.setItem(ID_CACHE, JSON.stringify(pack.identity)); } catch (e) {}
+              try { localStorage.setItem(ID_CACHE, JSON.stringify(pack.identity)); } catch (err) {}
             }
-            const books = Array.isArray(pack.books) && pack.books.length ? pack.books : ST.books;
-            const tagMap = {};
-            for (const b of books) tagMap[await bookTag(ST.id, b)] = b;
-            const rows = [];
-            for (const e of pack.entries) {
-              const b = tagMap[e.bookTag]; if (!b) continue;
-              try { rows.push(Object.assign({}, await aesDec(await bookKey(ST.id, b), e.cipher), { seq:e.seq })); }
-              catch (err) {}
+            if (Array.isArray(pack.books)) {
+              ST.books = Array.from(new Set(ST.books.concat(pack.books.filter(x => typeof x === 'string'))));
+              await LedgerStore.setMeta('books:' + ST.id.fp, ST.books);
             }
-            const list = rows.slice().reverse().slice(0, 8).map(p => '<div class="list-row"><div class="lr-main">' +
-              '<div class="lr-t">' + esc(p.note || '—') + '</div><div class="lr-s">' + esc(p.date) + ' · #' + p.seq + '</div></div>' +
-              '<div class="lr-v">' + (p.type === 'income' ? '+' : '-') + fmt(p.amount) + '</div></div>').join('') ||
-              '<div class="empty">没有能用当前助记词解开的记录</div>';
-            const canResubmit = ST.me.seq === 0 && pack.entries.length > 0;
-            const d = modal('<h3>加密账本恢复</h3>' +
-              '<div class="card-s">文件含 ' + pack.entries.length + ' 条密文，用当前助记词成功解开 <b style="color:var(--cyan)">' + rows.length + '</b> 条。文件里始终是密文，只有你能读。</div>' +
-              '<div style="margin:12px 0">' + list + '</div>' +
-              '<div class="note ' + (canResubmit ? 'good' : 'warn') + '">' + (canResubmit
-                ? '当前服务端账本为空，可逐条重新提交，完整重建链上记录；每条仍会通过序号、前序哈希、记录哈希与签名校验。'
-                : '服务端已有 ' + ST.me.seq + ' 条记录，为避免覆盖或重复，不提供重新提交。可在全新环境中恢复。') + '</div>' +
-              '<div class="row"><button class="btn" data-act="close-modal">关闭</button>' +
-              (canResubmit ? '<button class="btn primary" id="do-resubmit">重新提交到服务端</button>' : '') + '</div>');
-            if (canResubmit) d.querySelector('#do-resubmit').onclick = async () => {
-              try {
-                for (const e of pack.entries) await api('/api/entries', 'POST', {
-                  seq:e.seq, prevHash:e.prevHash, hash:e.hash, cipher:e.cipher, sig:e.sig,
-                  bookTag:e.bookTag, ts:e.ts });
-                d.remove(); await refresh(); render();
-                toast('已重建 ' + pack.entries.length + ' 条链上记录');
-              } catch (err) { toast('重建失败：' + err.message, 'err'); }
-            };
+            await refreshLocal(); render();
+            modal('<div class="eyebrow">备份已并入</div><h2>导入完成</h2><p class="muted">新增 ' + fresh.length + ' 条密文记录；服务端已经存在的记录会在同步时自动确认，不会重复入账。</p>' +
+              '<div class="notice success"><b>本机链高 ' + ST.me.seq + '</b><p>当前共有 ' + ST.outbox.length + ' 笔等待联网确认。</p></div><div class="button-row"><button class="btn primary" data-act="close-modal">完成</button></div>');
+            if (fresh.length) synchronize();
           } catch (err) { toast(err.message, 'err'); }
         };
-        i.click(); break;
+        input.click(); break;
       }
     }
   } catch (err) { toast(err.message || '操作失败', 'err'); }
 });
 
-try { const savedTheme = localStorage.getItem('jianji.theme'); if (savedTheme) document.documentElement.dataset.theme = savedTheme; } catch (e) {}
+window.addEventListener('online', () => {
+  ST.sync.online = true; ST.sync.status = 'idle'; paintSync();
+  if (ST.id) { toast('网络已恢复，正在自动上传本机记录'); synchronize(); }
+});
+window.addEventListener('offline', () => { ST.sync.online = false; ST.sync.status = 'offline'; paintSync(); if (ST.id) render(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && ST.id && navigator.onLine) synchronize(); });
+setInterval(() => { if (ST.id && navigator.onLine && !ST.syncing && !ST.sync.conflict) synchronize(); }, 30000);
+
+try {
+  const savedTheme = localStorage.getItem('jianji.theme');
+  document.documentElement.dataset.theme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+} catch (e) { document.documentElement.dataset.theme = 'light'; }
 if (!crypto || !crypto.subtle || !window.isSecureContext) {
-  $('#app').innerHTML = '<div class="wrap"><div class="card"><div class="card-t">需要安全上下文</div>' +
-    '<div class="card-s">Web Crypto 要求 HTTPS 或 localhost。请用部署后的 https 链接访问，或本机 http://127.0.0.1。</div></div></div>';
-} else render();
+  $('#app').innerHTML = '<div class="fatal"><h1>需要安全上下文</h1><p>Web Crypto 要求 HTTPS 或 localhost。请通过部署后的 HTTPS 地址，或本机 http://127.0.0.1 访问。</p></div>';
+} else {
+  render();
+  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}

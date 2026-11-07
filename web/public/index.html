@@ -1,16 +1,23 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark light">
-<title>简记 · 联网不可变账本</title>
+<meta name="theme-color" content="#12141f">
+<meta name="description" content="简记：断网也能记、联网自动同步的端到端加密不可变账本。">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<title>简记 · 离线优先的统一账本</title>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('jianji.theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}catch(e){}</script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<div class="fx"></div>
 <div id="app"></div>
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script src="/sync-core.cjs"></script>
+<script src="/offline-store.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
